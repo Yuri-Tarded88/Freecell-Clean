@@ -1,0 +1,152 @@
+name: Build & release APK
+
+# Every push to main (or master) builds the app and publishes a GitHub release with the APK attached.
+# Pushing a tag like v1.2.0 does the same with exactly that version.
+# (Want releases only for tags? Delete the "branches" and "paths-ignore" lines below.)
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a GitHub release (untick to only build the APK)
+        type: boolean
+        default: true
+
+permissions:
+  contents: write # needed to create the release and its tag
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      - uses: android-actions/setup-android@v4
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Work out the version
+        id: ver
+        run: |
+          base="$(node -p "require('./package.json').version")"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            name="${GITHUB_REF_NAME#v}"
+          else
+            name="${base%.*}.${GITHUB_RUN_NUMBER}"
+          fi
+          # versionCode must only ever go up; minutes since 1970 does that without depending on run history
+          code=$(( $(date +%s) / 60 ))
+          {
+            echo "name=$name"
+            echo "tag=v$name"
+            echo "code=$code"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building FreeCell $name (versionCode $code)"
+
+      - name: Stamp the version into the app
+        env:
+          VERSION_NAME: ${{ steps.ver.outputs.name }}
+        run: echo "window.APP_VERSION = '${VERSION_NAME}';" > www/js/version.js
+
+      - name: Sync web app into the Android project
+        run: |
+          npm run vendor
+          npx cap sync android
+
+      - name: Build release APK
+        working-directory: android
+        env:
+          VERSION_NAME: ${{ steps.ver.outputs.name }}
+          VERSION_CODE: ${{ steps.ver.outputs.code }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace -PappVersionCode="$VERSION_CODE" -PappVersionName="$VERSION_NAME"
+
+      - name: Sign APK
+        id: sign
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          VERSION_NAME: ${{ steps.ver.outputs.name }}
+        run: |
+          set -euo pipefail
+          build_tools="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          unsigned="$(find android/app/build/outputs/apk/release -name '*.apk' | head -n 1)"
+          [ -n "$unsigned" ] || { echo "::error::Gradle did not produce a release APK"; exit 1; }
+          aligned="$RUNNER_TEMP/aligned.apk"
+          "$build_tools/zipalign" -f -p 4 "$unsigned" "$aligned"
+
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            echo "Signing with your release key"
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            keystore="$RUNNER_TEMP/release.keystore"
+            export KEY_PASS="${KEY_PASS:-$KS_PASS}"
+            echo "signing=your release key" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=Signing::No signing secrets found, using the repo's shared debug key (ci/debug.keystore). Updates still install over each other, but add your own key before sharing the app widely (see README)."
+            keystore="ci/debug.keystore"
+            KS_PASS=android; KEY_PASS=android; KEY_ALIAS=androiddebugkey
+            export KS_PASS KEY_PASS KEY_ALIAS
+            echo "signing=the shared debug key" >> "$GITHUB_OUTPUT"
+          fi
+
+          mkdir -p dist
+          apk="dist/FreeCell-v${VERSION_NAME}.apk"
+          "$build_tools/apksigner" sign --ks "$keystore" --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:KS_PASS --key-pass env:KEY_PASS --out "$apk" "$aligned"
+          "$build_tools/apksigner" verify --verbose "$apk"
+          echo "apk=$apk" >> "$GITHUB_OUTPUT"
+
+      - name: Keep the APK as a build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: FreeCell-apk
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          NAME: ${{ steps.ver.outputs.name }}
+          APK: ${{ steps.sign.outputs.apk }}
+          SIGNING: ${{ steps.sign.outputs.signing }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" --clobber
+          else
+            gh release create "$TAG" "$APK" \
+              --target "$GITHUB_SHA" \
+              --title "FreeCell $NAME" \
+              --latest \
+              --generate-notes \
+              --notes "**Install:** download \`$(basename "$APK")\` on your Android phone and open it (allow installs from your browser or file manager if asked). Updates install over the previous version and keep your statistics. Signed with ${SIGNING}."
+          fi
